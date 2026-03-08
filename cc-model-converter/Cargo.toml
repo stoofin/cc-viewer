@@ -1,0 +1,22 @@
+[package]
+name = "cc-model-converter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+binread = "2"
+anyhow = "1"
+modular-bitfield = "0.13"
+glam = { version = "0.31", features = ["bytemuck"] }
+byteorder = "1"
+jzon = "0.12"
+bytemuck = { version = "1", features = ["derive"] }
+base64 = "0.22"
+png = "0.18"
+bitstream-io = "4"
+
+rawzip = "0.4"
+flate2 = "1"
+
+[profile.release]
+overflow-checks = true

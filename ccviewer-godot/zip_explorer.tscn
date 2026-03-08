@@ -1,0 +1,951 @@
+[gd_scene format=3 uid="uid://ddhp3w504oxoo"]
+
+[ext_resource type="Theme" uid="uid://buxrpvvwpe61f" path="res://ui_theme.tres" id="1_jhxm8"]
+[ext_resource type="Texture2D" uid="uid://b6qtikwqdd3xy" path="res://kloofendal_48d_partly_cloudy_puresky_4k.hdr" id="1_sgb71"]
+[ext_resource type="Script" uid="uid://bok6h7m0rqmow" path="res://TestPlayableCharacter.gd" id="3_jhxm8"]
+
+[sub_resource type="GDScript" id="GDScript_is1qn"]
+resource_name = "TreeScript"
+script/source = "extends Tree
+
+var itemPaths: Dictionary[TreeItem, String] = {}
+
+var cdrom_path = \"../originals-rde/zips/cdrom.dat\"
+
+var converters_list = []
+
+var last_loaded_path := \"\"
+var last_loaded_extras := []
+
+var context_menu_for_path = null
+
+const HIGHLIGHT_UGLY = 0 # supported but without texture
+const HIGHLIGHT_ANIMATIONS = 1
+const HIGHLIGHT_TEXTURE = 2
+const HIGHLIGHT_MODEL = 3
+const HIGHLIGHT_COLORS = [
+	Color(0.9, 0.4, 0.2),
+	Color(0.2,0.8, 0.9),
+	Color(0.5,1.0, 0.2),
+	Color(1.0, 0.9, 0.2)
+];
+var highlighted_already
+
+var highlight_paths = [
+	[\"battle/bg/.+\\\\.prd$\", HIGHLIGHT_MODEL],
+	[\"battle/bg/.+\\\\.ctd$\", HIGHLIGHT_UGLY],
+	[\"battle/(player|monster)/.+\\\\.obj$\", HIGHLIGHT_MODEL],
+	[\"battle/effects/.+\\\\.prd$\", HIGHLIGHT_MODEL],
+	[\"battle/effects/.+\\\\.ctd$\", HIGHLIGHT_UGLY],
+	[\"battle/wepon/.+\\\\.bin$\", HIGHLIGHT_MODEL],
+	[\"battle/wepon/.+\\\\.kmd$\", HIGHLIGHT_UGLY],
+	[\"fieldobj/ex/[^/]+\\\\.bin$\", HIGHLIGHT_ANIMATIONS],
+	[\"fieldobj/player/[^/]+/[^/]+\\\\.obj$\", HIGHLIGHT_MODEL],
+	[\"map/mapbin/[^/]+\\\\.bin$\", HIGHLIGHT_MODEL],
+	[\"map/mapbin/[^/]+\\\\.ctd$\", HIGHLIGHT_TEXTURE],
+	[\".+\\\\.tim$\", HIGHLIGHT_TEXTURE],
+	[\".+\\\\.ltc$\", HIGHLIGHT_TEXTURE],
+	[\".+\\\\.ltd$\", HIGHLIGHT_TEXTURE],
+	[\"^title.prd$\", HIGHLIGHT_MODEL],
+].map(func (a): return [RegEx.create_from_string(\"^(\" + a[0] + \")$\"), a[1]])
+
+const OVERWORLD = 1
+const TECH1 = 2
+const TECH2 = 3
+const TECH3 = 4
+
+func get_most_recent_converter():
+	var converters = converters_list.filter(func(path): return FileAccess.file_exists(path))
+	converters.sort_custom(func(a, b): return FileAccess.get_modified_time(a) < FileAccess.get_modified_time(b))
+	var result = converters.get(converters.size() - 1)
+	if result == null:
+		push_error(\"No converter binary found!\")
+	return result
+
+func _ready():
+	%ZipOpenButton.pressed.connect(_on_zip_open_press)
+	%TreeContextMenu.id_pressed.connect(_on_context_menu_pressed)
+	%TreeContextMenu.add_item(\"Add overworld animations (.bin)\", OVERWORLD)
+	%TreeContextMenu.add_separator()
+	%TreeContextMenu.add_item(\"Add tech animations (.prd)\", TECH1)
+	%TreeContextMenu.add_item(\"Add tech animations as 2nd character\", TECH2)
+	%TreeContextMenu.add_item(\"Add tech animations as 3rd character\", TECH3)
+	
+	if OS.get_name() == \"Linux\":
+		converters_list = [\"./cc-model-converter-release\", \"./cc-model-converter-debug\"]
+	elif OS.get_name() == \"Windows\":
+		converters_list = [\"./cc-model-converter-release.exe\", \"./cc-model-converter-debug.exe\"]
+	
+	self.item_activated.connect(on_activated)
+	self.item_selected.connect(on_select)
+	load_zip(cdrom_path)
+	
+func _gui_input(event: InputEvent) -> void:
+	if (
+		event is InputEventMouseButton
+		and event.button_index == MouseButton.MOUSE_BUTTON_RIGHT
+		and event.is_pressed()
+	):
+		var treeItem = get_item_at_position(event.position)
+		if treeItem != null:
+			context_menu_for_path = itemPaths[treeItem]
+			%TreeContextMenu.popup(Rect2i(event.global_position, Vector2i()))
+
+func _on_context_menu_pressed(id: int) -> void:
+	match id:
+		OVERWORLD: requestGltf(last_loaded_path, last_loaded_extras + [\"--add-bin-anims\", context_menu_for_path])
+		TECH1: requestGltf(last_loaded_path, last_loaded_extras + [\"--add-prd-anims\", context_menu_for_path, \"tech\"])
+		TECH2: requestGltf(last_loaded_path, last_loaded_extras + [\"--add-prd-anims\", context_menu_for_path, \"tec1\"])
+		TECH3: requestGltf(last_loaded_path, last_loaded_extras + [\"--add-prd-anims\", context_menu_for_path, \"tec2\"])
+	
+func _on_zip_open_press():
+	var open = func(status: bool, paths: PackedStringArray, _filterIndex: int):
+		if status:
+			load_zip(paths[0])
+	DisplayServer.file_dialog_show(
+		\"Open cdrom.dat\", \".\", \"cdrom.dat\", false,
+		DisplayServer.FILE_DIALOG_MODE_OPEN_FILE, [\"*.dat,*.zip\"],
+		open
+	)
+
+func set_ancestry_color(item: TreeItem, color_index: int) -> void:
+	var to_color = color_index
+	if item in highlighted_already:
+		to_color = max(highlighted_already[item], color_index)
+	item.set_custom_color(0, HIGHLIGHT_COLORS[to_color])
+	highlighted_already[item] = to_color
+	var parent = item.get_parent()
+	if parent != null:
+		set_ancestry_color(parent, color_index)
+
+func load_zip(zip_path: String):
+	var cdrom := ZIPReader.new()
+	var err := cdrom.open(zip_path)
+	if err != OK:
+		%PopupMessage.show_message(\"[color='red']Error opening zip file \" + zip_path + \"[/color]\")
+		return
+	cdrom_path = zip_path
+	var zip_name = zip_path.split(\"/\", false)[-1]
+	%ZipLabel.text = zip_name
+	clear()
+	var root := create_item()
+	hide_root = true
+	root.set_text(0, zip_name)
+	var directoryItems := {}
+	highlighted_already = {}
+	itemPaths.clear()
+	for file in cdrom.get_files():
+		var path := file.split(\"/\", false)
+		var parentItem = directoryItems.get(path.slice(0, path.size() - 1))
+		var item := create_item(parentItem)
+		item.set_text(0, path[path.size() - 1])
+		if file.ends_with(\"/\"):
+			directoryItems[path] = item
+		for highlight in highlight_paths:
+			var pattern = highlight[0]
+			var color_index = highlight[1]
+			if pattern.search(file) != null:
+				set_ancestry_color(item, color_index)
+		itemPaths[item] = file
+	root.set_collapsed_recursive(true)
+	root.collapsed = false
+
+func on_select():
+	#print(\"SELECTED: \", itemPaths[get_selected()])
+	pass
+	
+func generateGltf(args: Array):
+	var converter_path = get_most_recent_converter()
+	print(\"Using converter: \", converter_path)
+	LoadTimer.start(\"Generating gltf\")
+	
+	var child = OS.execute_with_pipe(converter_path, args, false)
+	var stdio: FileAccess = child[\"stdio\"]
+	var stderr: FileAccess = child[\"stderr\"]
+	var out = PackedByteArray()
+	while true:
+		while true:
+			var to_read = min(2048, stdio.get_length())
+			if to_read > 0:
+				var buffer = stdio.get_buffer(to_read)
+				if stdio.get_error() == OK:
+					out.append_array(buffer)
+				else:
+					print(stdio.get_error())
+			else:
+				break
+		while true:
+			var line = stderr.get_line()
+			if stderr.get_error() == OK:
+				print_rich(\"[color=blue]Converter: \", line)
+			else:
+				break
+		if not OS.is_process_running(child[\"pid\"]) and stdio.get_length() == 0 and stderr.get_length() == 0:
+			break
+		await get_tree().process_frame
+	var exitCode = OS.get_process_exit_code(child[\"pid\"])
+	
+	LoadTimer.stop()
+	print(\"Exit code: \", exitCode)
+	if exitCode == 0:
+		return out
+	else:
+		return null
+	
+func requestGltf(to_load: String, extras: Array = []):
+	if to_load.ends_with(\"/\"):
+		to_load += to_load.split(\"/\")[-2] + \".obj\"
+	var combat_model = to_load.begins_with(\"battle/\")
+	var args = [\"--format=gltf\", \"--zip\", cdrom_path] + extras + [to_load]
+	var generated = await generateGltf(args)
+	if generated != null:
+		last_loaded_path = to_load
+		last_loaded_extras = extras
+		%Preview.loadGltf(generated, combat_model)
+		get_viewport().get_window().title = \"Viewing \" + last_loaded_path
+	else:
+		%PopupMessage.show_message(\"[color='orange']Couldn't load \" + to_load.split(\"/\", false)[-1] + \"[/color]\")
+
+func on_activated():
+	#print(\"ACTIVATED: \", get_selected().get_text(0))
+	requestGltf(itemPaths[get_selected()])
+"
+
+[sub_resource type="GDScript" id="GDScript_je1mc"]
+resource_name = "PopupMessageScript"
+script/source = "extends RichTextLabel
+
+var tween: Tween = null
+
+func show_message(bbcode: String) -> void:
+	print_rich(\"Message: \" + bbcode)
+	text = bbcode
+	if tween != null:
+		tween.kill()
+	tween = create_tween()
+	tween.tween_property(self, \"visible\", true, 0.0)
+	tween.tween_property(self, ^\"position:y\", 41.0, 0.10)
+	tween.tween_interval(3.0)
+	tween.tween_property(self, ^\"position:y\", -size.y - 5.0, 1.0)
+	tween.tween_property(self, \"visible\", false, 0.0)
+"
+
+[sub_resource type="GDScript" id="GDScript_jhxm8"]
+resource_name = "SunlightScript"
+script/source = "extends DirectionalLight3D
+
+func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventMouseMotion:
+		if event.button_mask & MouseButtonMask.MOUSE_BUTTON_MASK_MIDDLE:
+			rotation.y += event.screen_relative.x * 0.01
+			# Rotating the sky makes me queasy :(
+			# %WorldEnvironment.environment.sky_rotation.y += event.screen_relative.x * 0.01
+"
+
+[sub_resource type="PanoramaSkyMaterial" id="PanoramaSkyMaterial_jhxm8"]
+panorama = ExtResource("1_sgb71")
+energy_multiplier = 0.8
+
+[sub_resource type="Sky" id="Sky_sgb71"]
+sky_material = SubResource("PanoramaSkyMaterial_jhxm8")
+
+[sub_resource type="Environment" id="Environment_jhxm8"]
+background_mode = 2
+sky = SubResource("Sky_sgb71")
+tonemap_mode = 2
+tonemap_agx_white = 16.5
+ssao_enabled = true
+glow_enabled = true
+glow_blend_mode = 0
+fog_light_color = Color(0.15936604, 0.75571877, 0.8706323, 1)
+fog_density = 0.0148
+fog_sky_affect = 0.06
+volumetric_fog_density = 0.01
+volumetric_fog_albedo = Color(0.49349463, 0.88453907, 0.97684735, 1)
+volumetric_fog_emission_energy = 0.1
+adjustment_enabled = true
+adjustment_brightness = 0.97
+adjustment_contrast = 1.02
+adjustment_saturation = 1.2
+
+[sub_resource type="GDScript" id="GDScript_sgb71"]
+resource_name = "CameraScript"
+script/source = "extends Camera3D
+
+@export var theta := 2.0 / 3.0 * PI
+@export var phi := 1.0 / 6.0 * PI
+@export var baseDistance := 5.0
+@export var distanceLog: = 0.0
+
+var focus := Vector3():
+	get:
+		return focus
+	set(f):
+		focus = f
+		update_pos()
+
+func _ready():
+	%FocusCameraButton.pressed.connect(_on_camera_focus)
+	update_pos()
+	
+func _on_camera_focus():
+	var bounds = %Preview.calculateBounds()
+	if bounds is AABB:
+		var tween = create_tween()
+		tween.set_ease(Tween.EASE_OUT)
+		tween.set_trans(Tween.TRANS_QUAD)
+		tween.tween_property(self, \"focus\", bounds.get_center(), 0.25)
+
+func _unhandled_input(event: InputEvent) -> void:
+	if get_viewport().get_camera_3d() != self: return
+	if event is InputEventMouseMotion:
+		if event.button_mask & MouseButtonMask.MOUSE_BUTTON_MASK_LEFT:
+			theta = fposmod(theta + event.screen_relative.x * TAU / 750.0, TAU)
+			phi = clamp(phi + event.screen_relative.y * TAU / 750.0, -0.49 * PI, 0.49 * PI)
+		elif event.button_mask & MouseButtonMask.MOUSE_BUTTON_MASK_RIGHT:
+			focus += -basis.x * event.screen_relative.x * 0.01 * pow(2.0, distanceLog)
+			focus += basis.y * event.screen_relative.y * 0.01 * pow(2.0, distanceLog)
+	elif event is InputEventMouseButton:
+		if event.button_index == MouseButton.MOUSE_BUTTON_WHEEL_UP:
+			distanceLog -= 0.2
+		elif event.button_index == MouseButton.MOUSE_BUTTON_WHEEL_DOWN:
+			distanceLog += 0.2
+		elif event.button_index == MouseButton.MOUSE_BUTTON_LEFT:
+			get_viewport().gui_release_focus()
+	update_pos()
+			
+func update_pos():
+	var distance = baseDistance * pow(2.0, distanceLog)
+	position = focus + Vector3(cos(theta) * cos(phi), sin(phi), sin(theta) * cos(phi)) * distance
+	look_at(focus)
+"
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_sgb71"]
+transparency = 1
+albedo_color = Color(1, 1, 1, 0.21568628)
+metallic = 0.35
+roughness = 0.58
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_44qaa"]
+top_radius = 10.0
+bottom_radius = 10.0
+height = 0.001
+
+[sub_resource type="CapsuleMesh" id="CapsuleMesh_je1mc"]
+
+[sub_resource type="GDScript" id="GDScript_44qaa"]
+resource_name = "PreviewScript"
+script/source = "extends Node3D
+
+const CCMeshInstance = preload(\"res://CCMeshInstance.gd\")
+const CCCameraPath = preload(\"res://CCCameraPath.gd\")
+const CCRoomCamera = preload(\"res://CCRoomCamera.gd\")
+const CCWalkMesh = preload(\"res://CCWalkMesh.gd\")
+
+var animPlayer: AnimationPlayer
+var isDraggingAnimationSlider := false
+var last_gltf = \"\"
+var isCombatModel = false
+
+const default_names_combat: Dictionary[String, String] = {
+	\"Anim0\": \"DefaultPose\",
+	\"Anim1\": \"Idle\",
+	\"Anim2\": \"AttackStance\",
+	\"Anim3\": \"Approach\",
+	\"Anim4\": \"Return\",
+	\"Anim5\": \"Hit1\",
+	\"Anim6\": \"Hit2\",
+	\"Anim7\": \"Hit3\",
+	\"Anim8\": \"Dead\",
+	\"Anim9\": \"Revive\",
+	\"Anim10\": \"IdleHurt\",
+	\"Anim11\": \"Dodge\",
+	\"Anim12\": \"Block\",
+	\"Anim13\": \"CastPrepare\",
+	\"Anim14\": \"KnockedDown\",
+	\"Anim15\": \"ReturnStart\",
+	\"Anim16\": \"ReturnEnd\",
+	\"Anim17\": \"ReturnLand\",
+	\"Anim18\": \"Cast\",
+	\"Anim19\": \"CastChannel\",
+	\"Anim20\": \"CastEnd\",
+	\"Anim21\": \"Defend\",
+}
+const default_names_field: Dictionary[String, String] = {
+	\"Anim0\": \"DefaultPose\",
+	\"Anim1\": \"Idle\",
+	\"Anim2\": \"Run\",
+	\"Anim3\": \"Walk\",
+	\"Anim5\": \"Climb\",
+	\"Anim6\": \"TurnRight\",
+	\"Anim7\": \"TurnLeft\",
+	\"Anim8\": \"SquareUp\",
+}
+
+func _ready():
+	%AnimationList.item_selected.connect(_animation_selected)
+	%AnimationSlider.value_changed.connect(_on_slider_value_changed)
+	%AnimationSlider.drag_started.connect(_on_slider_drag_started)
+	%AnimationSlider.drag_ended.connect(_on_slider_drag_ended)
+	%LoopToggle.toggled.connect(_on_loop_toggled)
+	%CastButton.pressed.connect(_on_cast_pressed)
+	%PlaybackRateSpinBox.value_changed.connect(_on_playback_rate_changed)
+	%ExportGLTFButton.pressed.connect(_on_export_press)
+	%GroundToggle.pressed.connect(func(): %Ground.visible = %GroundToggle.button_pressed)
+	%SpaceOutToggle.pressed.connect(_on_space_out_toggle)
+	%SkyToggle.pressed.connect(_on_sky_toggle)
+	%AnimateToggle.pressed.connect(_on_animate_toggle)
+	
+func _on_sky_toggle():
+	var env: Environment = %WorldEnvironment.environment
+	if %SkyToggle.button_pressed:
+		env.background_mode = Environment.BG_SKY
+	else:
+		env.background_mode = Environment.BG_COLOR
+		env.background_color = Color(0, 0, 0, 1.0)
+
+func loadGltf(gltfBuffer: PackedByteArray, is_combat_model: bool):
+	var state = GLTFState.new()
+	var doc = GLTFDocument.new()
+	LoadTimer.start(\"Parsing gltf\")
+	var err = doc.append_from_buffer(gltfBuffer, \"\", state)
+	LoadTimer.stop()
+	if err == OK:
+		last_gltf = gltfBuffer
+		isCombatModel = is_combat_model
+		# Godot is compressing the textures, is there a way to disable that? They're super tiny already anyway.
+		LoadTimer.start(\"Generating scene\")
+		var scene = doc.generate_scene(state)
+		LoadTimer.stop()
+		LoadTimer.start(\"Setting up scene\")
+		setScene(scene)
+		LoadTimer.stop()
+	else:
+		print(\"err \", err, \" appending to gltf from buffer\")
+		
+func _on_export_press():
+	var to_export = last_gltf
+	var save = func(status: bool, paths: PackedStringArray, _filterIndex: int):
+		if status:
+			var file = FileAccess.open(paths[0], FileAccess.WRITE)
+			if file != null:
+				file.store_buffer(to_export)
+				file.close()
+				%PopupMessage.show_message(\"Exported to \" + paths[0])
+	if to_export == \"\":
+		%PopupMessage.show_message(\"[color='red']Nothing to export![/color]\")
+	else:
+		DisplayServer.file_dialog_show(
+			\"Export glTF\", \".\", %Tree.get_selected().get_text(0), false,
+			DisplayServer.FILE_DIALOG_MODE_SAVE_FILE, [\"*.gltf\"],
+			save
+		)
+		
+func _on_cast_pressed():
+	if animPlayer is AnimationPlayer:
+		animPlayer.queue(\"Anim13\")
+		animPlayer.queue(\"Anim13\")
+		animPlayer.queue(\"Anim18\")
+		animPlayer.queue(\"Anim19\")
+		animPlayer.queue(\"Anim19\")
+		animPlayer.queue(\"Anim19\")
+		animPlayer.queue(\"Anim20\")
+	
+func calculateBounds(node: Node = self):
+	var aabb = null
+	if node is VisualInstance3D:
+		aabb = node.get_aabb()
+	for child in node.get_children():
+		var childAabb = calculateBounds(child)
+		if childAabb != null:
+			if aabb != null:
+				aabb = aabb.merge(childAabb)
+			else:
+				aabb = childAabb
+	if aabb != null and node is Node3D:
+		aabb = node.transform * aabb
+	return aabb
+
+var originalPositions = {}
+func spaceOutChildren(node: Node, spacing = 0.5):
+	var x = null
+	for child in node.get_children():
+		if child is Node3D:
+			var bounds = calculateBounds(child)
+			if bounds is AABB:
+				if x == null:
+					x = bounds.end.x
+				else:
+					child.position.x += x - bounds.position.x
+					x += bounds.size.x
+				x += spacing
+	var totalBounds = calculateBounds(node)
+	if totalBounds is AABB:
+		for child in node.get_children():
+			if child is Node3D:
+				child.position.x -= totalBounds.get_center().x
+
+func layoutScene(node):
+	originalPositions.clear()
+	for child in node.get_children():
+		if child is Node3D:
+			originalPositions[child] = child.position
+
+	var background = node.find_child(\"Background\", false)
+	if background is Node:
+		node.remove_child(background)
+	spaceOutChildren(node)
+	var totalBounds = calculateBounds(node)
+	if background is Node:
+		node.add_child(background)
+		background.set_owner(node)
+	if background is Node3D:
+		var bgBounds = calculateBounds(background)
+		if bgBounds is AABB:
+			background.position.y -= bgBounds.position.y
+			background.position.x -= bgBounds.get_center().x
+			if totalBounds is AABB:
+				background.position.z -= 1.0 + bgBounds.end.z - totalBounds.position.z
+
+func _on_space_out_toggle():
+	if get_child_count() == 0: return
+	var node = get_child(0)
+	var shouldSpaceOut = %SpaceOutToggle.button_pressed
+	if not shouldSpaceOut:
+		for child in node.get_children():
+			if child is Node3D and child in originalPositions:
+				child.position = originalPositions[child]
+	else:
+		layoutScene(node)
+
+func _setup_blend_mode(meshInstance: MeshInstance3D):
+	var mesh = meshInstance.mesh
+	for surface_idx in mesh.get_surface_count():
+		var material: StandardMaterial3D = mesh.surface_get_material(surface_idx)
+		match material.get_meta(\"extras\") if material.has_meta(\"extras\") else null:
+			{\"blend_mode\": \"mix\", ..}:
+				pass
+			{\"blend_mode\": \"add\", ..}:
+				material.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+			{\"blend_mode\": \"subtract\", ..}:
+				material.blend_mode = BaseMaterial3D.BLEND_MODE_SUB
+
+func setScene(node: Node):
+	for child in get_children():
+		remove_child(child)
+		child.queue_free()
+	for child in %TempControls.get_children():
+		child.queue_free()
+	for untyped_child in node.find_children(\"\", \"MeshInstance3D\"):
+		var child = untyped_child as MeshInstance3D
+		_setup_blend_mode(child)
+		if child.has_meta(\"extras\") and child.get_meta(\"extras\").has(\"animations\"):
+			child.set_script(CCMeshInstance)
+		#if child.name.contains(\"WalkMesh\"):
+			#child.mesh.surface_get_material(0).no_depth_test = true
+	for untyped_child in node.find_children(\"\", \"Node3D\"):
+		var child = untyped_child as Node3D
+		if child.has_meta(\"extras\") and child.get_meta(\"extras\").has(\"point_pairs\"):
+			child.set_script(CCCameraPath)
+	var navCamera = node.find_child(\"Room3DCamera\", true, false)
+	if navCamera is Camera3D:
+		navCamera.set_script(CCRoomCamera)
+	var walkMesh = node.find_child(\"*-WalkMesh\", true, false)
+	if walkMesh is MeshInstance3D:
+		walkMesh.set_script(CCWalkMesh)
+	if navCamera != null and walkMesh != null:
+		var roomNode = Node3D.new()
+		roomNode.name = \"Room\"
+		node.add_child(roomNode)
+		navCamera.reparent(roomNode, false)
+		walkMesh.reparent(roomNode, false)
+	add_child(node)
+	node.owner = self
+	# fixupBlendModes(node)
+	var background = node.find_child(\"Background\", false)
+	if %SpaceOutToggle.button_pressed:
+		layoutScene(node)
+	if background is Node:
+		for meshInstance in background.find_children(\"\", \"MeshInstance3D\", true, false):
+			var mi = meshInstance as MeshInstance3D
+			mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			
+			var check := CheckBox.new()
+			check.text = meshInstance.name
+			check.button_pressed = true
+			%TempControls.add_child(check)
+			check.toggled.connect(func(b): mi.visible = b)
+	if navCamera is Camera3D:
+		var btn := CheckButton.new()
+		btn.text = \"Room Camera\"
+		%TempControls.add_child(btn)
+		btn.toggled.connect(func(b): navCamera.current = b)
+		var baseScale = 1.0
+		# Hardcoded offset? Authored for 320x240? (psx is 256x224 though...?)
+		var offsetX = -160.0
+		var offsetY = 120.0
+		var zOffset = 0.0
+		match navCamera.get_meta(\"extras\"):
+			{ \"cameraMystery\":  { \"unknown1\": var unk1, \"unknown2\": var unk2, .. }, .. }:
+				baseScale = unk1
+				zOffset = -unk2 / 64.0
+		for meshInstance in background.find_children(\"\", \"MeshInstance3D\", false, false):
+			var mi = meshInstance as MeshInstance3D
+			background.remove_child(mi)
+			navCamera.add_child(mi)
+			print(\"Original z for \", meshInstance.name, \": \", mi.position.z * 625.0)
+			mi.position.z = zOffset + mi.position.z * 625.0 / 40.0 # 625.0/40.0 is close to 16 (15.625), relevant?
+			mi.scale = Vector3(-mi.position.z, -mi.position.z, -mi.position.z) / baseScale
+			mi.position.x = offsetX * mi.scale.x
+			mi.position.y = offsetY * mi.scale.y
+	if walkMesh is MeshInstance3D:
+		%RoomCharacter.walkMesh = walkMesh
+
+	%AnimationList.clear()
+	animPlayer = node.find_child(\"AnimationPlayer\")
+	if animPlayer is AnimationPlayer:
+		var animLibrary = animPlayer.get_animation_library('')
+		animPlayer.animation_finished.connect(_on_animation_finished)
+		animPlayer.animation_started.connect(_on_animation_started)
+		animPlayer.speed_scale = %PlaybackRateSpinBox.value
+		animPlayer.deterministic = true
+		var anims = Array(animPlayer.get_animation_list())
+		anims.sort_custom(func(a: String, b: String): return a.naturalnocasecmp_to(b) < 0)
+		for animation in anims:
+			var with_hint = animation
+			var default_names = default_names_combat if isCombatModel else default_names_field
+			if default_names.has(animation):
+				with_hint += \" (\" + default_names[animation] + \")\"
+			var index = %AnimationList.add_item(with_hint)
+			%AnimationList.set_item_metadata(index, animation)
+			animLibrary.add_animation(\"LOOPING\" + animation, make_looped_version(animPlayer.get_animation(animation)))
+
+func _animation_selected(index: int) -> void:
+	if animPlayer is AnimationPlayer:
+		animPlayer.seek(0)
+		var toPlay = (\"LOOPING\"  if %LoopToggle.button_pressed else \"\") + %AnimationList.get_item_metadata(index)
+		print(\"Playing \" + toPlay)
+		animPlayer.play(toPlay)
+
+func _on_play_button_pressed() -> void:
+	if animPlayer is AnimationPlayer:
+		if animPlayer.is_playing():
+			animPlayer.pause()
+			#process_mode = Node.PROCESS_MODE_DISABLED
+		else:
+			animPlayer.play()
+			#process_mode = Node.PROCESS_MODE_INHERIT
+			
+func _on_playback_rate_changed(playbackRate: float) -> void:
+	if animPlayer is AnimationPlayer:
+		animPlayer.speed_scale = playbackRate
+
+func _on_slider_drag_started() -> void:
+	isDraggingAnimationSlider = true
+	if animPlayer is AnimationPlayer:
+		animPlayer.pause()
+
+func _on_slider_value_changed(value: float) -> void:
+	if not isDraggingAnimationSlider: return
+	if animPlayer is AnimationPlayer:
+		animPlayer.seek(value * animPlayer.current_animation_length, true)
+
+func _on_slider_drag_ended(_changed) -> void:
+	isDraggingAnimationSlider = false
+	
+func _on_animation_started(_animationName) -> void:
+	#process_mode = Node.PROCESS_MODE_INHERIT
+	pass
+
+func _on_animation_finished(_animationName) -> void:
+	#process_mode = Node.PROCESS_MODE_DISABLED
+	pass
+
+const KEYFRAME_DURATION = 1.0 / 15.0
+func make_looped_version(animation: Animation) -> Animation:
+	var new_animation = animation.duplicate_deep(Resource.DEEP_DUPLICATE_ALL)
+	# print(\"Making looped version of animation with length: \" + str(new_animation.length))
+	if new_animation.length < 0.05: return new_animation
+	new_animation.length += KEYFRAME_DURATION
+	for track_index in animation.get_track_count():
+		var initial_value = new_animation.track_get_key_value(track_index, 0)
+		new_animation.track_insert_key(track_index, new_animation.length, initial_value)
+	new_animation.loop_mode = Animation.LOOP_LINEAR
+	return new_animation
+			
+func _on_loop_toggled(toggledOn) -> void:
+	if animPlayer is AnimationPlayer:
+		var animName = animPlayer.assigned_animation
+		animName = animName.replace('LOOPING', '')
+		var time = animPlayer.current_animation_position
+		if toggledOn:
+			animPlayer.play(\"LOOPING\" + animName)
+		else:
+			animPlayer.assigned_animation = animName
+		animPlayer.seek(time, true)
+	
+func _process(_delta: float) -> void:
+	if animPlayer is AnimationPlayer and animPlayer.current_animation != &\"\":
+		%AnimationSlider.value = float(animPlayer.current_animation_position) / animPlayer.current_animation_length
+
+func _on_animate_toggle():
+	process_mode = Node.PROCESS_MODE_INHERIT if %AnimateToggle.button_pressed else Node.PROCESS_MODE_DISABLED
+"
+
+[node name="Node3D" type="Node3D" unique_id=1637260983]
+
+[node name="HSplitContainer" type="HSplitContainer" parent="." unique_id=528566691]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme = ExtResource("1_jhxm8")
+split_offsets = PackedInt32Array(161, 173)
+split_offset = 161
+
+[node name="VBoxContainer" type="VBoxContainer" parent="HSplitContainer" unique_id=2120871227]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="MarginContainer" type="MarginContainer" parent="HSplitContainer/VBoxContainer" unique_id=1841932399]
+layout_mode = 2
+theme_override_constants/margin_left = 5
+theme_override_constants/margin_top = 5
+
+[node name="HBoxContainer" type="HBoxContainer" parent="HSplitContainer/VBoxContainer/MarginContainer" unique_id=1607332856]
+layout_mode = 2
+
+[node name="ZipLabel" type="Label" parent="HSplitContainer/VBoxContainer/MarginContainer/HBoxContainer" unique_id=683006393]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Zip Contents"
+
+[node name="ZipOpenButton" type="Button" parent="HSplitContainer/VBoxContainer/MarginContainer/HBoxContainer" unique_id=1324029725]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Load..."
+
+[node name="PanelContainer" type="PanelContainer" parent="HSplitContainer/VBoxContainer" unique_id=823401502]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="Tree" type="Tree" parent="HSplitContainer/VBoxContainer/PanelContainer" unique_id=163537055]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(200, 0)
+layout_mode = 2
+mouse_force_pass_scroll_events = false
+script = SubResource("GDScript_is1qn")
+
+[node name="MarginContainer" type="MarginContainer" parent="HSplitContainer" unique_id=1498092118]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/margin_top = 5
+theme_override_constants/margin_bottom = 5
+
+[node name="VBoxContainer2" type="VBoxContainer" parent="HSplitContainer/MarginContainer" unique_id=1067048700]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="HBoxContainer2" type="HBoxContainer" parent="HSplitContainer/MarginContainer/VBoxContainer2" unique_id=1687286950]
+layout_mode = 2
+
+[node name="FocusCameraButton" type="Button" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer2" unique_id=221458869]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 0
+text = "Center Camera"
+
+[node name="GroundToggle" type="CheckButton" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer2" unique_id=754544403]
+unique_name_in_owner = true
+layout_mode = 2
+button_pressed = true
+text = "Ground"
+
+[node name="SpaceOutToggle" type="CheckButton" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer2" unique_id=1705457713]
+unique_name_in_owner = true
+layout_mode = 2
+button_pressed = true
+text = "Space Out"
+
+[node name="SkyToggle" type="CheckButton" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer2" unique_id=686125898]
+unique_name_in_owner = true
+layout_mode = 2
+button_pressed = true
+text = "Sky"
+
+[node name="AnimateToggle" type="CheckButton" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer2" unique_id=1472058576]
+unique_name_in_owner = true
+layout_mode = 2
+button_pressed = true
+text = "Animate"
+
+[node name="Control" type="Control" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer2" unique_id=953273306]
+layout_mode = 2
+size_flags_horizontal = 3
+
+[node name="ExportGLTFButton" type="Button" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer2" unique_id=228107946]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 8
+text = "Export glTF..."
+
+[node name="HBoxContainer3" type="HBoxContainer" parent="HSplitContainer/MarginContainer/VBoxContainer2" unique_id=2005934097]
+layout_mode = 2
+size_flags_vertical = 3
+
+[node name="TempControls" type="VBoxContainer" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer3" unique_id=1473448543]
+unique_name_in_owner = true
+layout_mode = 2
+
+[node name="Control" type="Control" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer3" unique_id=473175282]
+layout_mode = 2
+size_flags_vertical = 3
+mouse_filter = 2
+
+[node name="HBoxContainer" type="HBoxContainer" parent="HSplitContainer/MarginContainer/VBoxContainer2" unique_id=87852111]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 8
+
+[node name="PlayButton" type="Button" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer" unique_id=1714893198]
+layout_mode = 2
+size_flags_horizontal = 6
+size_flags_stretch_ratio = 0.0
+text = "Play"
+
+[node name="MarginContainer" type="MarginContainer" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer" unique_id=1496583616]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/margin_left = 6
+theme_override_constants/margin_top = 0
+theme_override_constants/margin_right = 6
+
+[node name="AnimationSlider" type="HSlider" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer/MarginContainer" unique_id=469881993]
+unique_name_in_owner = true
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 4
+max_value = 1.0
+step = 0.0
+
+[node name="PlaybackRateSpinBox" type="SpinBox" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer" unique_id=698977774]
+unique_name_in_owner = true
+layout_mode = 2
+min_value = 0.01
+max_value = 2.0
+step = 0.005
+value = 1.0
+allow_greater = true
+alignment = 1
+suffix = "x"
+
+[node name="LoopToggle" type="CheckButton" parent="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer" unique_id=339952741]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Loop"
+
+[node name="VBoxContainer2" type="VBoxContainer" parent="HSplitContainer" unique_id=113263616]
+layout_mode = 2
+
+[node name="AnimationList" type="ItemList" parent="HSplitContainer/VBoxContainer2" unique_id=1007647780]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(150, 0)
+layout_mode = 2
+size_flags_vertical = 3
+mouse_force_pass_scroll_events = false
+theme_override_font_sizes/font_size = 12
+allow_reselect = true
+
+[node name="MarginContainer" type="MarginContainer" parent="HSplitContainer/VBoxContainer2" unique_id=1002613118]
+layout_mode = 2
+theme_override_constants/margin_right = 5
+theme_override_constants/margin_bottom = 5
+
+[node name="CastButton" type="Button" parent="HSplitContainer/VBoxContainer2/MarginContainer" unique_id=854284149]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Play Cast Sequence"
+
+[node name="PopupMessage" type="RichTextLabel" parent="." unique_id=68285527]
+unique_name_in_owner = true
+anchors_preset = 5
+anchor_left = 0.5
+anchor_right = 0.5
+offset_left = -223.0
+offset_top = -56.37
+offset_right = 225.0
+offset_bottom = -10.369999
+grow_horizontal = 2
+bbcode_enabled = true
+text = "Message"
+fit_content = true
+scroll_active = false
+horizontal_alignment = 1
+script = SubResource("GDScript_je1mc")
+
+[node name="TreeContextMenu" type="PopupMenu" parent="." unique_id=726586443]
+unique_name_in_owner = true
+
+[node name="Sunlight" type="DirectionalLight3D" parent="." unique_id=1634222592]
+transform = Transform3D(-0.9093002, -0.078987345, -0.40857595, -0.22865207, -0.72549933, 0.6491294, -0.34769452, 0.6836751, 0.6416363, 0.26386455, 3.1741197, 2.4591992)
+light_energy = 0.8
+shadow_enabled = true
+script = SubResource("GDScript_jhxm8")
+
+[node name="SpotLight3D" type="SpotLight3D" parent="Sunlight" unique_id=1837559975]
+transform = Transform3D(-0.7186109, 0.12204215, 0.6846198, -0.08362562, 0.9621705, -0.25929666, -0.690366, -0.24358515, -0.6812203, 3.3219624, -1.4026717, -4.5642824)
+light_color = Color(0.65897685, 0.8869109, 0.99133474, 1)
+light_energy = 0.8
+light_cull_mask = 4294967293
+
+[node name="BounceLight" type="DirectionalLight3D" parent="Sunlight" unique_id=634871970]
+transform = Transform3D(-0.617091, -0.7825594, 0.08246137, -0.4199909, 0.41616774, 0.8064813, -0.66543716, 0.46303922, -0.5854812, -1.394716, 3.5367951, -1.4885573)
+light_color = Color(0.5680805, 0.3547733, 4.813075e-07, 1)
+light_energy = 0.8
+light_cull_mask = 4294967293
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=112186409]
+unique_name_in_owner = true
+environment = SubResource("Environment_jhxm8")
+
+[node name="Camera" type="Camera3D" parent="." unique_id=778837706]
+unique_name_in_owner = true
+transform = Transform3D(0.7725119, 0.25588626, -0.5811605, 0, 0.91521305, 0.40297037, 0.6350002, -0.3112994, 0.707013, -1.6504623, 2.0461192, 2.0699224)
+script = SubResource("GDScript_sgb71")
+
+[node name="Ground" type="MeshInstance3D" parent="." unique_id=1255574740]
+unique_name_in_owner = true
+layers = 2
+material_override = SubResource("StandardMaterial3D_sgb71")
+mesh = SubResource("CylinderMesh_44qaa")
+
+[node name="RoomCharacter" type="Node3D" parent="." unique_id=718744377]
+unique_name_in_owner = true
+transform = Transform3D(0.125, 0, 0, 0, 0.125, 0, 0, 0, 0.125, 0, 0, 0)
+script = ExtResource("3_jhxm8")
+
+[node name="DefaultCylinder" type="MeshInstance3D" parent="RoomCharacter" unique_id=1956444077]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0)
+mesh = SubResource("CapsuleMesh_je1mc")
+
+[node name="Preview" type="Node3D" parent="." unique_id=413206711]
+unique_name_in_owner = true
+script = SubResource("GDScript_44qaa")
+
+[node name="Label3D" type="Label3D" parent="Preview" unique_id=2008393838]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.133296, 0)
+texture_filter = 5
+render_priority = 1
+outline_render_priority = 0
+text = "1. Choose a zip file:
+cdrom.dat for the originals
+cdrom2.dat for the new versions
+
+2. Double click a file to view it!
+Supported files are highlighted:
+Models are yellow, and textures are green."
+autowrap_trim_flags = 64
+
+[connection signal="pressed" from="HSplitContainer/MarginContainer/VBoxContainer2/HBoxContainer/PlayButton" to="Preview" method="_on_play_button_pressed"]
