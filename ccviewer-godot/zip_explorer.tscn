@@ -344,7 +344,7 @@ const CCWalkMesh = preload(\"res://CCWalkMesh.gd\")
 
 var animPlayer: AnimationPlayer
 var isDraggingAnimationSlider := false
-var last_gltf = \"\"
+var last_gltf = null
 var isCombatModel = false
 
 const default_names_combat: Dictionary[String, String] = {
@@ -432,7 +432,7 @@ func _on_export_press():
 				file.store_buffer(to_export)
 				file.close()
 				%PopupMessage.show_message(\"Exported to \" + paths[0])
-	if to_export == \"\":
+	if to_export == null:
 		%PopupMessage.show_message(\"[color='red']Nothing to export![/color]\")
 	else:
 		DisplayServer.file_dialog_show(
